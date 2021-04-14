@@ -7,6 +7,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
 import java.net.InetAddress;
 import java.security.KeyManagementException;
 import java.security.NoSuchAlgorithmException;
@@ -14,6 +16,9 @@ import java.security.NoSuchProviderException;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -68,6 +73,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -122,6 +128,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
     private final SynchronizationPoint<SmackException> compressSyncPoint = new SynchronizationPoint<>(
             this, "stream compression");
     
+    
 	static 
 	{
 		final int numProcessors = Runtime.getRuntime().availableProcessors();
@@ -129,6 +136,50 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 		
 		// create a default event loop group
 		eventLoopGrp = new NioEventLoopGroup(numThreads);
+		
+		try
+		{
+			/*
+			 * Override the CACHED_EXECUTOR_SERVICE executor.  The CACHED_EXECUTOR_SERVICE is an open ended
+			 * list of threads that could cause resource exhaustion in highly concurrent environments.
+			 * The override implementation will fix the thread count to the same number of threads 
+			 * for the Netty event loop group.   
+			 */
+			final Field field = AbstractXMPPConnection.class.getDeclaredField("CACHED_EXECUTOR_SERVICE");
+			
+			field.setAccessible(true);
+			
+		    final Field modifiersField = Field.class.getDeclaredField("modifiers");
+		    modifiersField.setAccessible(true);
+		    modifiersField.setInt(field, field.getModifiers() & ~Modifier.FINAL);
+			
+			final ExecutorService NETTYSMACK_CACHED_EXECUTOR_SERVICE = Executors.newFixedThreadPool(numThreads, new ThreadFactory() 
+		    {
+		        @Override
+		        public Thread newThread(Runnable runnable) 
+		        {
+		            final Thread thread = new Thread(runnable);
+		            thread.setName("Netty Smack Cached Executor");
+		            thread.setDaemon(true);
+		            thread.setUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() 
+		            {
+		                @Override
+		                public void uncaughtException(Thread t, Throwable e) 
+		                {
+		                    LOGGER.log(Level.WARNING, t + " encountered uncaught exception", e);
+		                }
+		            });
+		            return thread;
+		        }
+		    });	
+			
+			field.set(modifiersField, NETTYSMACK_CACHED_EXECUTOR_SERVICE);
+		}
+		catch (Exception e)
+		{
+			LOGGER.warning("Failed to override CACHED_EXECUTOR_SERVICE and falling back to default implementation. " 
+					+ "This may result in high thread usage if multipel connections are made in the same JVM.");
+		}
 	}
 	
 	public XMPPNettyTCPConnection(XMPPTCPConnectionConfiguration config) 
@@ -289,7 +340,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
         	{
 	        	connectionChannel.writeAndFlush("</stream:stream>");      	
 	        	
-	        	connectionChannel.closeFuture().sync();
+	        	connectionChannel.closeFuture();
         	}
         	catch (Exception e)
         	{
@@ -337,6 +388,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 				final Bootstrap b = new Bootstrap();
 				b.group(eventLoopGrp)
 				.channel(NioSocketChannel.class)
+				.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000)
 				.handler(new ChannelInitializer<SocketChannel>() 
 				{
 					@Override
@@ -354,6 +406,8 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 						
 					}
 				});	  
+				
+				
 				
 				try
 				{
