@@ -442,6 +442,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 		{		
 			try
 			{
+				Thread.sleep(1);
 				openStream(ctx);
 			}
 			catch (Exception e)
@@ -668,6 +669,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
         String id = getStreamId();
 
         sendNonza(new StreamOpen(to, from, id));
+      
 	
 	}
 	
