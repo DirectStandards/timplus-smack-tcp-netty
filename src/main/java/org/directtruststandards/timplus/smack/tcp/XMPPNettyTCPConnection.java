@@ -98,11 +98,13 @@ import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
  * effectively double the number of cores. 
  * 
  * @author Greg Meyer
- *
+ * @since 1.0
  */
 public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 {
 	protected static final int FALLBACK_EVENT_LOOP_THREADS = 4;
+	
+	protected static final String ZLIB_COMPRESSION = "zlib";
 	
 	protected static EventLoopGroup eventLoopGrp;
 	
@@ -250,12 +252,16 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
         
         for (String method : compression.getMethods())
         {
-        	if (method.compareToIgnoreCase("zlib") == 0)
+        	/*
+        	 * ZLIB compression will be the only algorithm we
+        	 * will support
+        	 */
+        	if (method.compareToIgnoreCase(ZLIB_COMPRESSION) == 0)
         	{
         		compressionDecoder = new JdkZlibDecoder(ZlibWrapper.ZLIB);
         		compressionEncoder = new JdkZlibEncoder(ZlibWrapper.ZLIB);
         		
-        		compressSyncPoint.sendAndWaitForResponseOrThrow(new Compress("zlib"));
+        		compressSyncPoint.sendAndWaitForResponseOrThrow(new Compress(ZLIB_COMPRESSION));
         		
         		break;
         	}
@@ -271,7 +277,11 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
     protected void installCompressionHandlers(ChannelHandlerContext ctx)
     {
     	final ChannelPipeline pl = ctx.pipeline();
-    	
+    
+    	/*
+    	 * Install the compression decoder and encoder in the proper 
+    	 * spot of the pipeline
+    	 */
 		pl.addBefore("string-encoder", "compress-decoder", compressionEncoder);
 		pl.addBefore("xmpp-framedecoder", "compression-decoder" , compressionDecoder);
 
@@ -281,7 +291,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 	@Override
 	protected void connectInternal() throws SmackException, IOException, XMPPException, InterruptedException 
 	{
-		closingStreamReceived.init();
+		initState();
 		
 		/*
 		 * First close any exist connections
@@ -358,6 +368,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
         maybeCompressFeaturesReceived.init();
         compressSyncPoint.init();
         initialOpenStreamSend.init();
+        closingStreamReceived.init();
         
         this.sslHandler = null;
         this.connectionChannel = null;
@@ -368,7 +379,8 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
     protected void setWasAuthenticated() 
     {
         // Never reset the flag if the connection has ever been authenticated
-        if (!wasAuthenticated) {
+        if (!wasAuthenticated) 
+        {
             wasAuthenticated = authenticated;
         }
     }
@@ -394,9 +406,16 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 					@Override
 					public void initChannel(SocketChannel ch) throws Exception 
 					{
-						ChannelPipeline p = ch.pipeline();
+						final ChannelPipeline p = ch.pipeline();
 						
-			
+						/*
+						 * The outbound flow will encode elements into a XML Stringthen 
+						 * transform it into a ByteBuf
+						 * 
+						 * The incoming flow will decode incoming bytes into individual XML frames
+						 * then handle each frame with a StanzaHandler
+						 * 
+						 */
 						p.addLast("string-encoder", new StringEncoder());	
 						p.addLast(new ElementEncoder());
 						
@@ -407,8 +426,6 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 					}
 				});	  
 				
-				
-				
 				try
 				{
 					final ChannelFuture f = b.connect(inetAddress, port);
@@ -417,7 +434,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 				}
 				catch (Exception e)
 				{
-					// TODO: Log error
+					LOGGER.warning("Failed to connect to host " + host + " on port " + port + ": " + e.getMessage());
 					continue;
 				}
 				
@@ -442,19 +459,34 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 		{		
 			try
 			{
+				/* TODO: Address this later where the connection fails
+				 * to send outbound opening streams without a slight pause
+				 * when using multiple connections in the same JVM
+				 */
 				Thread.sleep(1);
 				openStream(ctx);
+				initialOpenStreamSend.reportSuccess();
 			}
 			catch (Exception e)
 			{
-				
+				LOGGER.warning("Failed sending open stream stanza: " + e.getMessage());
+				initialOpenStreamSend.reportFailure(e);
 			}
-			initialOpenStreamSend.reportSuccess();
+			
 		}
 		
 		@Override
 		protected void channelRead0(ChannelHandlerContext ctx, ByteBuf in) throws Exception 
 		{	
+			/*
+			 * The incoming ByteBuf contains XML frames
+			 * that consist of XMPP stanzas.  Because these are not
+			 * part of a contiguous "Stream", an opening Stream fragment
+			 * is prepended to maintain the Namespace context of XMPP.  This results
+			 * in almost all stanzas not having a proper closing </Stream> element to make 
+			 * them complete XML instances, but that is our expected behavior.
+			 */
+			
 			boolean done = false;
 			
 			byte[] bytes;
@@ -660,6 +692,9 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 	
 	protected void openStream(ChannelHandlerContext ctx) throws Exception
 	{
+		/*
+		 * Send an opening stream stanza
+		 */
         final CharSequence to = getXMPPServiceDomain();
         CharSequence from = null;
         CharSequence localpart = config.getUsername();
@@ -694,6 +729,7 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 
         /*
          * For now, just default a reasonable TLS context that will trust any server
+         * Later iterations may allow for custom TLS contexts to be configured.
          */
         final SslContext sslCtx = SslContextBuilder.forClient().sslProvider(null)
                 .trustManager(InsecureTrustManagerFactory.INSTANCE).build();
@@ -701,6 +737,10 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
         sslHandler = sslCtx.newHandler(ctx.channel().alloc(), this.host, this.port);
         sslHandler.engine().setEnabledProtocols(new String[] {"TLSv1.2"});
                
+        /*
+         * Add the TLS handler in the proper place in the pipeline.  This will
+         * kickoff the TLS handshake and upgrade our socket to a secure socket (if all goes well).
+         */
         ctx.pipeline().addFirst("sslHandler", sslHandler);
 
     }	
@@ -720,6 +760,11 @@ public class XMPPNettyTCPConnection extends AbstractXMPPConnection
 
             if (config.getSecurityMode() != ConnectionConfiguration.SecurityMode.disabled) 
             {
+            	/*
+            	 * Send the commands to start TLS.  This will be followed by a <proceed> message
+            	 * from the server.  In response, we will initialize a TLS handler and proceed
+            	 * with the TLS handshake in the proceedTLSReceived method.
+            	 */
                 sendNonza(new StartTls());
             } 
             else 
