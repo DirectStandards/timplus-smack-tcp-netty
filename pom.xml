@@ -4,7 +4,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>org.directtruststandards</groupId>
 	<artifactId>timplus-smack-tcp-netty</artifactId>
-	<version>1.0.0</version>
+	<version>1.0.1-SNAPSHOT</version>
 	<name>TIM+ smack TCP connection with Netty</name>
 	<description>An implementation of a TCP smack connection using the Netty networking framework.</description>
     <url>https://github.com/DirectStandards/timplus-smack-tcp-netty</url>   
